@@ -3,6 +3,7 @@ import boto3
 import csv
 import io
 import psycopg2
+from datetime import datetime
 
 s3 = boto3.client('s3')
 
@@ -10,17 +11,20 @@ def lambda_handler(event, context):
     # Generate timestamps
     start_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')  # For Redshift-compatible timestamp
     csv_timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%S')  # For unique CSV filenames
-    
+
+    conn = None
+    cursor = None
+
     try:
         # Extract bucket name and object key from the event
         bucket_name = event['Records'][0]['s3']['bucket']['name']
         object_key = event['Records'][0]['s3']['object']['key']
-        
+
         # Get the file from S3
         response = s3.get_object(Bucket=bucket_name, Key=object_key)
         file_content = response['Body'].read().decode('utf-8')
 
-        # Connecting To Redshift DataBase
+        # Connecting to Redshift
         conn = psycopg2.connect(
             dbname='actual_products', 
             user='aws_user_name', 
@@ -30,7 +34,7 @@ def lambda_handler(event, context):
         )
         cursor = conn.cursor()
 
-         # Creating staging table
+        # Creating staging table
         cursor.execute("DROP TABLE IF EXISTS staging;")
         cursor.execute("""
         CREATE TABLE staging (
@@ -43,9 +47,9 @@ def lambda_handler(event, context):
         );
         """)
 
-         # Read CSV content
+        # Read CSV content
         csv_reader = csv.reader(io.StringIO(file_content))
-        next(csv_reader) 
+        next(csv_reader)  # Skip header
 
         # Insert rows into staging table
         insert_query = """
@@ -54,61 +58,46 @@ def lambda_handler(event, context):
         """
         for row in csv_reader:
             cursor.execute(insert_query, row)
-        
+
         conn.commit()
 
-        # Identify newly inserted rows (fetch all relevant columns) and store the results
+        # Identify new rows and count them
         cursor.execute("""
-        SELECT ProductID, ProductName, SupplierID, CategoryID, Unit, Price
-        FROM staging
+        SELECT COUNT(*) FROM staging
         WHERE ProductID NOT IN (SELECT ProductID FROM product);
         """)
-        new_products = cursor.fetchall()  # Store new products for CSV generation
+        insert_count = cursor.fetchone()[0]
 
-        # Insert new rows into the product table
+        # Insert new rows into product table
         cursor.execute("""
         INSERT INTO product (ProductID, ProductName, SupplierID, CategoryID, Unit, Price)
         SELECT ProductID, ProductName, SupplierID, CategoryID, Unit, Price
         FROM staging
         WHERE ProductID NOT IN (SELECT ProductID FROM product);
         """)
-
         conn.commit()
 
-      # Creating other Main tables
-
-       # Creating Audit Table
+        # Insert audit entry
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS audit (
-          Aud_id INT IDENTITY(1,1) PRIMARY KEY,  -- Auto-incremented ID for each Lambda execution
-          update_count INT,                      -- Number of rows updated
-          insert_count INT,                      -- Number of rows inserted
-          ProductID INT,                         -- ProductID being inserted/updated
-          start_date TIMESTAMP,                  -- Time when Lambda started
-          end_date TIMESTAMP                     -- Time when Lambda finished
-        );
-        """)
+        INSERT INTO audit (update_count, insert_count, start_date, end_date)
+        VALUES (%s, %s, %s, %s)
+        """, (0, insert_count, start_time, datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')))
         conn.commit()
-      
-        # Creating Product Table
-        cursor.execute("""
-        CREATE TABLE product (
-          ProductID INTEGER NOT NULL,
-          ProductName VARCHAR(255),
-          SupplierID INTEGER,
-          CategoryID INTEGER,
-          Unit VARCHAR(255),
-          Price DOUBLE PRECISION
-        );
-        """)
-      
-        # Close the connection
-        cursor.close()
-        conn.close()
 
-      except Exception as e:
+    except Exception as e:
         return {
             'statusCode': 500,
             'body': json.dumps(f"Error: {str(e)}")
         }
 
+    finally:
+        # Close connections in all cases
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps("Lambda function executed successfully.")
+    }
